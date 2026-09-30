@@ -9,6 +9,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 // module and used elsewhere in the hook — keep it a harmless stub.
 const patchRuntimeTweenInPlace = vi.fn<(...args: unknown[]) => boolean>();
 const applySoftReload = vi.fn<(...args: unknown[]) => string>();
+const nestedCompositionSources = vi.fn<(...args: unknown[]) => string[]>(() => []);
+const readNestedFiles = vi.fn<(...args: unknown[]) => Promise<Record<string, string>>>();
 const trackStudioEvent = vi.fn();
 
 vi.mock("./gsapRuntimePatch", () => ({
@@ -17,6 +19,8 @@ vi.mock("./gsapRuntimePatch", () => ({
 vi.mock("../utils/gsapSoftReload", () => ({
   applySoftReload: (...args: unknown[]) => applySoftReload(...args),
   extractGsapScriptText: () => "",
+  nestedCompositionSources: (...args: unknown[]) => nestedCompositionSources(...args),
+  readNestedFiles: (...args: unknown[]) => readNestedFiles(...args),
 }));
 vi.mock("../utils/studioTelemetry", () => ({
   trackStudioEvent: (...args: unknown[]) => trackStudioEvent(...args),
@@ -266,6 +270,21 @@ describe("applyPreviewSync", () => {
         escalated: c.escalated,
       }),
     );
+  });
+
+  it("reads the nested compositions the reload resets before restoring their elements", async () => {
+    nestedCompositionSources.mockReturnValueOnce(["compositions/sub.html"]);
+    readNestedFiles.mockResolvedValueOnce({ "compositions/sub.html": "SUB" });
+    applySoftReload.mockReturnValue("applied");
+    const nested = { from: "index.html", read: vi.fn() };
+    const opts = { label: "x", softReload: true };
+    applyPreviewSync(FAKE_IFRAME, result({ scriptText: "SCRIPT" }), opts, vi.fn(), nested);
+    expect(applySoftReload).not.toHaveBeenCalled();
+    await vi.waitFor(() => expect(applySoftReload).toHaveBeenCalled());
+    expect(readNestedFiles).toHaveBeenCalledWith(["compositions/sub.html"], nested);
+    expect(applySoftReload.mock.calls[0]![2]).toMatchObject({
+      nestedFiles: { "compositions/sub.html": "SUB" },
+    });
   });
 
   it("reloads the preview when the result carries no written file to restore from", () => {

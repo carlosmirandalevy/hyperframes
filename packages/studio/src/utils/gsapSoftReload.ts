@@ -1,7 +1,5 @@
-import { COLOR_GRADING_SOURCE_HIDDEN_ATTR } from "@hyperframes/core/color-grading";
 import { isCompositionTemplate } from "@hyperframes/parsers/hf-ids";
-import { findAuthoredElement, parseSavedSource } from "./authoredSource";
-import { applyAuthoredInlineOpacity, readStampedAuthoredOpacity } from "./authoredOpacity";
+import { findAuthoredElement, parseSavedSource, toProjectPath } from "./authoredSource";
 
 type IframeWindow = Window & {
   __timelines?: Record<string, { kill?: () => void; pause?: () => void }>;
@@ -132,13 +130,17 @@ function verifyTimelinesPopulated(win: IframeWindow, targetKeys: string[]): bool
   return Object.keys(timelines).filter((k) => k !== "__proxied").length > 0;
 }
 
-// The reloaded file, and which composition file it is (null for the top-level one).
-type Fresh = { file: Document; own: string | null };
+// The reloaded file, which composition file it is (null for the top-level one), and the nested files read.
+type Fresh = { file: Document; own: string | null; nested: Map<string, Document> };
 
-// What a fresh load puts in the style attribute; undefined inside an inlined composition, which the bundler rewrites.
-function freshInlineStyle({ file, own }: Fresh, el: Element): string | null | undefined {
-  if (own !== null || sourceFile(el.parentElement) !== null) return undefined;
-  return findAuthoredElement(file, el)?.getAttribute("style") ?? null;
+// What a fresh load puts in the style attribute; undefined when no file read here can say, so only a full load can.
+function freshInlineStyle({ file, own, nested }: Fresh, el: Element): string | null | undefined {
+  const src = sourceFile(el.parentElement);
+  const doc = src === own ? file : src === null ? undefined : nested.get(src);
+  if (!doc || el.hasAttribute("data-hf-inner-root")) return undefined;
+  const style = findAuthoredElement(doc, el)?.getAttribute("style") ?? null;
+  // The preview re-points a nested file's asset urls at that file's folder.
+  return src !== null && style?.includes("url(") ? undefined : style;
 }
 
 // The preview marks an inlined composition with data-composition-file; the runtime loader keeps -src.
@@ -157,26 +159,13 @@ function compositionRoot(doc: Document, key: string): Element | undefined {
   );
 }
 
-function restoreNestedInline(el: HTMLElement, css: string): void {
-  const s = el.style;
-  s.cssText = css;
-  s.transform = "";
-  const authored = readStampedAuthoredOpacity(el);
-  if (authored !== null) {
-    applyAuthoredInlineOpacity(s, authored);
-  } else if (
-    el.hasAttribute(COLOR_GRADING_SOURCE_HIDDEN_ATTR) &&
-    s.getPropertyValue("opacity") === "0" &&
-    s.getPropertyPriority("opacity") === "important"
-  ) {
-    s.removeProperty("opacity");
-  }
-}
-
 // A script's clone of a plain template's element has no counterpart in the file; only a full load rebuilds it.
 function mayBeTemplateClone(fresh: Fresh, el: Element): boolean {
   if (freshInlineStyle(fresh, el) !== null) return false;
-  return [...fresh.file.querySelectorAll("template")].some(
+  const templates = [fresh.file, ...fresh.nested.values()].flatMap((doc) => [
+    ...doc.querySelectorAll("template"),
+  ]);
+  return templates.some(
     (t) =>
       !isCompositionTemplate(t) &&
       [...t.content.querySelectorAll("*")].some(
@@ -193,17 +182,13 @@ type TimelineLike = {
 
 function resetToFile(win: IframeWindow, fresh: Fresh, targets: Element[]): void {
   if (targets.length === 0 || !win.gsap?.set) return;
-  const saved = targets.map(
-    (el) => [el as HTMLElement, (el as HTMLElement).style?.cssText] as const,
-  );
   try {
     win.gsap.set(targets, { clearProps: "all" });
   } catch {}
-  for (const [el, css] of saved) {
+  for (const el of targets) {
     const style = freshInlineStyle(fresh, el);
-    if (style === undefined) restoreNestedInline(el, css ?? "");
-    else if (style === null) el.removeAttribute("style");
-    else el.setAttribute("style", style);
+    if (style) el.setAttribute("style", style);
+    else el.removeAttribute("style");
   }
 }
 
@@ -233,17 +218,67 @@ function collectTargets(win: IframeWindow, doc: Document, keys: string[]): Eleme
   return [...new Set(targets)];
 }
 
-function planReset(win: IframeWindow, doc: Document, keys: string[], authoredHtml: string) {
-  const own = sourceFile(keys.map((key) => compositionRoot(doc, key)).find(Boolean));
-  const fresh: Fresh = { file: parseSavedSource(authoredHtml), own };
+function reloadedSource(doc: Document, keys: string[]): string | null {
+  return sourceFile(keys.map((key) => compositionRoot(doc, key)).find(Boolean));
+}
+
+function planReset(win: IframeWindow, doc: Document, keys: string[], options: SoftReloadOptions) {
+  const nested = Object.entries(options.nestedFiles ?? {});
+  const fresh: Fresh = {
+    file: parseSavedSource(options.authoredHtml),
+    own: reloadedSource(doc, keys),
+    nested: new Map(nested.map(([src, html]) => [src, parseSavedSource(html)])),
+  };
   const targets = collectTargets(win, doc, keys);
-  return targets.some((el) => mayBeTemplateClone(fresh, el)) ? null : { fresh, targets };
+  const rebuildable = targets.every(
+    (el) => freshInlineStyle(fresh, el) !== undefined && !mayBeTemplateClone(fresh, el),
+  );
+  return rebuildable ? { fresh, targets } : null;
+}
+
+function timelineKeys(scriptText: string): string[] {
+  return [...scriptText.matchAll(/__timelines\s*\[\s*["'`]([^"'`]+)["'`]\s*\]/g)]
+    .map((m) => m[1]!)
+    .filter((key) => key !== "__proxied");
+}
+
+/** Each other composition file a reload of `scriptText` would reset an element of. */
+export function nestedCompositionSources(
+  iframe: HTMLIFrameElement | null,
+  scriptText: string,
+): string[] {
+  const win = iframe?.contentWindow as IframeWindow | null | undefined;
+  const doc = iframe?.contentDocument;
+  if (!win || !doc) return [];
+  const keys = timelineKeys(scriptText);
+  const own = reloadedSource(doc, keys);
+  const sources = collectTargets(win, doc, keys).map((el) => sourceFile(el.parentElement));
+  return [...new Set(sources.filter((src): src is string => src !== null && src !== own))];
+}
+
+export interface NestedFileReader {
+  /** The composition file the sources are relative to. */
+  from: string;
+  read: (path: string) => Promise<string>;
+}
+
+/** An unreadable file is left out, so the soft reload refuses and the preview reloads instead. */
+export async function readNestedFiles(
+  sources: string[],
+  reader: NestedFileReader,
+): Promise<Record<string, string>> {
+  const read = (src: string) => reader.read(toProjectPath(reader.from, src)).catch(() => null);
+  const entries = await Promise.all(sources.map(async (src) => [src, await read(src)] as const));
+  return Object.fromEntries(
+    entries.filter((entry): entry is [string, string] => entry[1] !== null),
+  );
 }
 
 function gsapParsedInOwnComposition(doc: Document, key: string): Element[] {
   const comp = compositionRoot(doc, key);
   if (!comp) return [];
-  return [comp, ...comp.querySelectorAll("*")].filter(
+  const ownRoot = sourceFile(comp.parentElement) === sourceFile(comp) ? [comp] : [];
+  return [...ownRoot, ...comp.querySelectorAll("*")].filter(
     (el) =>
       "_gsap" in el && (el === comp || el.parentElement?.closest("[data-composition-id]") === comp),
   );
@@ -300,6 +335,8 @@ export interface SoftReloadOptions {
   currentTimeOverride?: number;
   /** The file as just written: every reset element gets its inline style back from it. */
   authoredHtml: string;
+  /** The other composition files a reset element was written in, by nestedCompositionSources' names. */
+  nestedFiles?: Record<string, string>;
   /** A first edit's GSAP bootstrap: "added" may run with no live script, "removed" tears down and runs nothing. */
   bootstrap?: "added" | "removed";
 }
@@ -361,9 +398,7 @@ function scopeScript(doc: Document, scriptText: string, bootstrap: SoftReloadOpt
   // of the global timeline — so tearing down ALL of them (or the global timeline's
   // children) and re-running a single script wipes every OTHER composition,
   // reverting its edits. Scope the teardown to the keys THIS script re-registers.
-  const targetKeys = [...scriptText.matchAll(/__timelines\s*\[\s*["'`]([^"'`]+)["'`]\s*\]/g)]
-    .map((m) => m[1]!)
-    .filter((key) => key !== "__proxied");
+  const targetKeys = timelineKeys(scriptText);
   if (targetKeys.length === 0) return null; // can't scope safely → full reload
   const gsapScripts = findGsapScriptElements(doc);
   if (gsapScripts.length === 0 && bootstrap !== "added") return null;
@@ -388,7 +423,7 @@ export function applySoftReload(
   scriptText: string,
   options: SoftReloadOptions,
 ): SoftReloadResult {
-  const { onAsyncFailure, currentTimeOverride, authoredHtml, bootstrap } = options;
+  const { onAsyncFailure, currentTimeOverride, bootstrap } = options;
   const removeScript = bootstrap === "removed";
   if (!iframe || !scriptText) return "cannot-soft-reload";
 
@@ -417,7 +452,7 @@ export function applySoftReload(
   // full iframe reload that destroys the very WebGL context we're preserving.
   let deferredToAsync = false;
 
-  const reset = planReset(win, doc, targetKeys, authoredHtml);
+  const reset = planReset(win, doc, targetKeys, options);
   if (!reset) return "cannot-soft-reload";
   const { fresh, targets } = reset;
 

@@ -5,6 +5,8 @@ import {
   applySoftReload,
   applySoftReloadFinalization,
   ensureMotionPathPluginLoaded,
+  nestedCompositionSources,
+  readNestedFiles,
 } from "./gsapSoftReload";
 
 const FILE = { authoredHtml: "<html><body></body></html>" };
@@ -564,7 +566,7 @@ describe("applySoftReload restores each element's inline style from the file", (
     expect(el.getAttribute("style")).toBe("opacity: 0.3");
   });
 
-  it("a nested composition's reload keeps what the parent file and the bundler wrote", () => {
+  it("a nested composition's reload refuses to restyle what the parent file or the bundler wrote", () => {
     const doc = document.implementation.createHTMLDocument("");
     doc.body.innerHTML =
       `<div data-composition-id="root"><div data-composition-file="compositions/sub.html" id="host" data-hf-id="hf-host" data-composition-id="sub" style="left: 300px; transform: translateY(9px)">` +
@@ -582,8 +584,10 @@ describe("applySoftReload restores each element's inline style from the file", (
     });
     Object.assign(iframe, { contentDocument: doc });
     const sub = `<template><div id="sub" data-hf-id="hf-in" data-composition-id="sub"></div></template>`;
-    applySoftReload(iframe, SCRIPT_TEXT.replaceAll('"root"', '"sub"'), { authoredHtml: sub });
-    expect([host.style.left, host.style.transform]).toEqual(["300px", ""]);
+    expect(
+      applySoftReload(iframe, SCRIPT_TEXT.replaceAll('"root"', '"sub"'), { authoredHtml: sub }),
+    ).toBe("cannot-soft-reload");
+    expect([host.style.left, host.style.transform]).toEqual(["300px", "translateY(9px)"]);
     expect([inner.style.width, inner.style.height]).toEqual(["1920px", "400px"]);
   });
 
@@ -596,17 +600,94 @@ describe("applySoftReload restores each element's inline style from the file", (
     expect(el.hasAttribute("style")).toBe(false);
   });
 
-  it("keeps a nested composition's element's inline style, minus GSAP's transform", () => {
-    const host = document.createElement("div");
-    host.setAttribute("data-composition-file", "compositions/sub.html"); // as the preview inlines it
-    const el = document.createElement("img");
-    el.setAttribute("data-hf-id", "hf-from-sub");
-    el.setAttribute("data-hf-authored-opacity", "0.5");
-    el.setAttribute("style", "left: 10px; opacity: 0; transform: translate(9px, 9px)");
-    host.appendChild(el);
-    const { iframe } = buildIframeWithTarget(el);
-    applySoftReload(iframe, SCRIPT_TEXT, { authoredHtml: page(`<div id="box"></div>`) });
-    expect([el.style.left, el.style.opacity, el.style.transform]).toEqual(["10px", "0.5", ""]);
+  describe("a nested composition's element gets its inline style from its own file", () => {
+    const nestedTarget = () => {
+      const host = document.createElement("div");
+      host.setAttribute("data-composition-file", "compositions/sub.html");
+      const el = document.createElement("img");
+      el.setAttribute("data-hf-id", "hf-from-sub");
+      el.setAttribute("style", "left: 10px; opacity: 0; transform: translate(9px, 9px)");
+      host.appendChild(el);
+      return el;
+    };
+    const SUB = `<template><div data-composition-id="sub"><img data-hf-id="hf-from-sub" style="left: 12px"></div></template>`;
+
+    it("restores what a fresh load of that file gives it", () => {
+      const el = nestedTarget();
+      const { iframe } = buildIframeWithTarget(el);
+      const nestedFiles = { "compositions/sub.html": SUB };
+      expect(applySoftReload(iframe, SCRIPT_TEXT, { authoredHtml: page(""), nestedFiles })).toBe(
+        "applied",
+      );
+      expect(el.getAttribute("style")).toBe("left: 12px");
+    });
+
+    it("refuses without that file rather than guess, leaving the element as it was", () => {
+      const el = nestedTarget();
+      const { iframe } = buildIframeWithTarget(el);
+      expect(applySoftReload(iframe, SCRIPT_TEXT, { authoredHtml: page("") })).toBe(
+        "cannot-soft-reload",
+      );
+      expect(el.style.left).toBe("10px");
+    });
+
+    it("names the files to read: the hosts of the elements the reload resets", () => {
+      const el = nestedTarget();
+      const { iframe } = buildIframeWithTarget(el);
+      expect(nestedCompositionSources(iframe, SCRIPT_TEXT)).toEqual(["compositions/sub.html"]);
+    });
+
+    it("reads each file relative to the composition, leaving out one it cannot read", async () => {
+      const read = vi.fn(async (path: string) => {
+        if (path === "scenes/missing.html") throw new Error("404");
+        return `<${path}>`;
+      });
+      const files = await readNestedFiles(["sub.html", "missing.html"], {
+        from: "scenes/main.html",
+        read,
+      });
+      expect(files).toEqual({ "sub.html": "<scenes/sub.html>" });
+    });
+
+    it("a reload of the nested composition itself restores its elements from that file", () => {
+      const el = nestedTarget();
+      const host = el.parentElement!;
+      host.setAttribute("data-composition-id", "root");
+      const { iframe } = buildIframeWithTarget(el);
+      const doc = iframe.contentDocument as unknown as { querySelectorAll: (s: string) => unknown };
+      const base = doc.querySelectorAll;
+      doc.querySelectorAll = (sel) => (sel === "[data-composition-id]" ? [host] : base(sel));
+      expect(applySoftReload(iframe, SCRIPT_TEXT, { authoredHtml: SUB })).toBe("applied");
+      expect(el.getAttribute("style")).toBe("left: 12px");
+    });
+
+    it("a nested composition's reload leaves its host, which the parent file writes, alone", () => {
+      const script = SCRIPT_TEXT.replaceAll('"root"', '"sub"');
+      const doc = document.implementation.createHTMLDocument("");
+      doc.body.innerHTML =
+        `<div data-composition-id="root"><div id="host" data-composition-file="compositions/sub.html" data-composition-id="sub" style="left: 300px; opacity: 0.5">` +
+        `<div id="n"></div></div></div><script>${script}</script>`;
+      Object.assign(doc.getElementById("host")!, { _gsap: {} });
+      const { iframe } = buildMockIframe({
+        gsap: { timeline: vi.fn(), set: vi.fn() },
+        __timelines: { sub: { kill: vi.fn(), getChildren: () => [] } },
+      });
+      Object.assign(iframe, { contentDocument: doc });
+      const sub = `<template><div data-composition-id="sub"><div id="n"></div></div></template>`;
+      expect(applySoftReload(iframe, script, { authoredHtml: sub })).not.toBe("cannot-soft-reload");
+      expect(doc.getElementById("host")!.getAttribute("style")).toBe("left: 300px; opacity: 0.5");
+    });
+
+    it("refuses a nested inline style with an asset url, which the preview rewrites", () => {
+      const el = nestedTarget();
+      const { iframe } = buildIframeWithTarget(el);
+      const nestedFiles = {
+        "compositions/sub.html": SUB.replace("left: 12px", "background: url(a.png)"),
+      };
+      expect(applySoftReload(iframe, SCRIPT_TEXT, { authoredHtml: page(""), nestedFiles })).toBe(
+        "cannot-soft-reload",
+      );
+    });
   });
 
   it("the finalize seek cannot paint the killed timeline over the restored transform", () => {

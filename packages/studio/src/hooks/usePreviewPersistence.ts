@@ -11,7 +11,11 @@ import {
   type StudioPendingEditsDrainResult,
 } from "../utils/studioPendingEdits";
 import { trackStudioEvent } from "../utils/studioTelemetry";
-import { applyUndoRestoreToPreview, type UndoRestoreFile } from "../utils/gsapUndoRestore";
+import {
+  applyUndoRestoreToPreview,
+  readUndoNestedFiles,
+  type UndoRestoreFile,
+} from "../utils/gsapUndoRestore";
 import { usePlayerStore } from "../player";
 import { syncStoredAutomationFromPreview } from "../player/lib/automationStoreSync";
 
@@ -194,12 +198,18 @@ export function usePreviewPersistence({
       // attributes onto the live DOM and re-runs the timeline at the SAME playhead,
       // falling back to reloadPreview for anything structural (split/delete undo),
       // multi-file, sub-comp, or a permanent soft-reload failure.
+      const from = activeCompPathRef.current ?? "index.html";
+      const nestedFiles = await readUndoNestedFiles(previewIframeRef.current, restore.files, {
+        from,
+        read: _readOptionalProjectFile,
+      });
       const strategy = applyUndoRestoreToPreview(
         previewIframeRef.current,
         activeCompPathRef.current,
         restore.files,
         usePlayerStore.getState().currentTime,
         reloadPreview,
+        nestedFiles,
       );
       if (strategy === "full") {
         const player = usePlayerStore.getState();
@@ -214,7 +224,7 @@ export function usePreviewPersistence({
       // reload. The full path above clears the store and waits for discovery instead.
       syncStoredAutomationFromPreview(previewIframeRef.current?.contentDocument ?? null);
     },
-    [previewIframeRef, activeCompPathRef, reloadPreview],
+    [previewIframeRef, activeCompPathRef, reloadPreview, _readOptionalProjectFile],
   );
 
   // ── Migrate legacy studio-motion.json ──

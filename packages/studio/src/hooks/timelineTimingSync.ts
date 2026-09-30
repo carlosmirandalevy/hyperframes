@@ -3,7 +3,13 @@
 // edit's undo history, and swapping the rewritten script into the live preview
 // without a full iframe reload when possible.
 import { type TimelineElement, usePlayerStore } from "../player/store/playerStore";
-import { applySoftReload, applySoftReloadFinalization } from "../utils/gsapSoftReload";
+import {
+  applySoftReload,
+  applySoftReloadFinalization,
+  nestedCompositionSources,
+  readNestedFiles,
+  type NestedFileReader,
+} from "../utils/gsapSoftReload";
 import { furthestClipEndFromDocument } from "../player/lib/timelineElementHelpers";
 import type { RecordEditInput } from "../utils/studioFileHistory";
 import { patchDocumentRootDuration } from "./timelineEditingGsap";
@@ -111,6 +117,7 @@ function syncTimingEditPreview(
   currentTime: number,
   reloadPreview: () => void,
   rebindWhenUnmutated: boolean,
+  nestedFiles?: Record<string, string>,
 ): void {
   if (!outcome.mutated && rebindWhenUnmutated) {
     if (!rebindPreviewTiming(iframe, currentTime)) reloadPreview();
@@ -124,6 +131,7 @@ function syncTimingEditPreview(
     onAsyncFailure: reloadPreview,
     currentTimeOverride: currentTime,
     authoredHtml: outcome.after,
+    nestedFiles,
   });
   if (result === "cannot-soft-reload") reloadPreview();
 }
@@ -141,6 +149,7 @@ async function finishTimelineTimingFallback(input: {
    * edit).
    */
   rebindWhenUnmutated: boolean;
+  nested?: NestedFileReader;
 }): Promise<void> {
   let outcome: GsapMutationStatus = { mutated: false, scriptText: null };
   if (input.gsapMutation) {
@@ -154,12 +163,18 @@ async function finishTimelineTimingFallback(input: {
       return;
     }
   }
+  const sources = outcome.scriptText
+    ? nestedCompositionSources(input.iframe, outcome.scriptText)
+    : [];
+  const nestedFiles =
+    input.nested && sources.length > 0 ? await readNestedFiles(sources, input.nested) : undefined;
   syncTimingEditPreview(
     input.iframe,
     outcome,
     usePlayerStore.getState().currentTime,
     input.reloadPreview,
     input.rebindWhenUnmutated,
+    nestedFiles,
   );
 }
 
@@ -436,6 +451,9 @@ export function finishClipTimingFallback(input: {
         : undefined,
     onGsapError,
     rebindWhenUnmutated: true,
+    nested: projectId
+      ? { from: targetPath, read: (path: string) => readFileContent(projectId, path) }
+      : undefined,
   });
 }
 
@@ -504,5 +522,6 @@ export async function finishGroupTimingGsapFallback<C extends { element: Timelin
     // to re-derive clip windows — the in-place timing rebind covers that. But
     // when another file changed, only a full reload reflects every file.
     rebindWhenUnmutated: !otherFileChanged,
+    nested: { from: activePath, read: (path: string) => readFileContent(input.projectId, path) },
   });
 }

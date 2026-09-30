@@ -3,7 +3,13 @@ import { findUnsafeMutationValues } from "@hyperframes/core/studio-api/finite-mu
 import { readProjectFileContent as readSharedProjectFileContent } from "../utils/studioFileHistory";
 import type { DomEditSelection } from "../components/editor/domEditingTypes";
 import { usePlayerStore } from "../player/store/playerStore";
-import { applySoftReload, extractGsapScriptText } from "../utils/gsapSoftReload";
+import {
+  applySoftReload,
+  extractGsapScriptText,
+  nestedCompositionSources,
+  readNestedFiles,
+  type NestedFileReader,
+} from "../utils/gsapSoftReload";
 import type { SoftReloadResult } from "../utils/gsapSoftReload";
 import { trackStudioEvent } from "../utils/studioTelemetry";
 import { serializeStudioFileMutation } from "../utils/studioFileMutationCoordinator";
@@ -124,13 +130,14 @@ function finishUnchangedMutation(
   result: MutationResult,
   options: CommitMutationOptions,
   reloadPreview: () => void,
+  nested: NestedFileReader,
 ): boolean {
   if (result.changed !== false) return false;
   if (
     !options.skipReload &&
     (instantPatchesFor(options).length > 0 || options.previewFallbackLatch?.pending)
   ) {
-    applyPreviewSync(iframe, result, options, reloadPreview);
+    applyPreviewSync(iframe, result, options, reloadPreview, nested);
   }
   return true;
 }
@@ -141,9 +148,10 @@ function refreshMutationPreview(
   options: CommitMutationOptions,
   reloadPreview: () => void,
   onCacheInvalidate: () => void,
+  nested: NestedFileReader,
 ): void {
   options.beforeReload?.();
-  applyPreviewSync(iframe, result, options, reloadPreview);
+  applyPreviewSync(iframe, result, options, reloadPreview, nested);
   onCacheInvalidate();
 }
 
@@ -167,7 +175,9 @@ function syncCommittedGsapMutation({
   forceReloadSdkSession,
   reloadPreview,
   onCacheInvalidate,
+  nested,
 }: {
+  nested: NestedFileReader;
   iframe: HTMLIFrameElement | null;
   selection: DomEditSelection;
   mutation: Record<string, unknown>;
@@ -195,7 +205,7 @@ function syncCommittedGsapMutation({
       iframe?.contentDocument,
     );
   }
-  refreshMutationPreview(iframe, result, options, reloadPreview, onCacheInvalidate);
+  refreshMutationPreview(iframe, result, options, reloadPreview, onCacheInvalidate, nested);
 }
 
 /**
@@ -218,6 +228,21 @@ function softReloadOrEscalate(
   reloadPreview: () => void,
   origin: "preview_sync" | "sdk_refresh",
   authoredHtml: string,
+  nested?: NestedFileReader,
+): void {
+  const sources = nested ? nestedCompositionSources(iframe, scriptText) : [];
+  const soft = (nestedFiles?: Record<string, string>) =>
+    softReloadWithFiles(iframe, scriptText, reloadPreview, origin, { authoredHtml, nestedFiles });
+  if (nested && sources.length > 0) void readNestedFiles(sources, nested).then(soft);
+  else soft();
+}
+
+function softReloadWithFiles(
+  iframe: HTMLIFrameElement | null,
+  scriptText: string,
+  reloadPreview: () => void,
+  origin: "preview_sync" | "sdk_refresh",
+  files: { authoredHtml: string; nestedFiles?: Record<string, string> },
 ): void {
   // Seek the rebuilt timeline to the studio's own authoritative scrub position,
   // not the iframe's raw `__player.getTime()` — see the comment in
@@ -226,7 +251,7 @@ function softReloadOrEscalate(
   const result: SoftReloadResult = applySoftReload(iframe, scriptText, {
     onAsyncFailure: reloadPreview,
     currentTimeOverride: currentTime,
-    authoredHtml,
+    ...files,
   });
   if (result === "applied") return;
   trackStudioEvent("gsap_soft_reload_outcome", {
@@ -251,6 +276,7 @@ export function applyPreviewSync(
   result: MutationResult,
   options: CommitMutationOptions,
   reloadPreview: () => void,
+  nested?: NestedFileReader,
 ): void {
   const patches = instantPatchesFor(options);
   let needsFallback = options.previewFallbackLatch?.pending === true;
@@ -290,7 +316,14 @@ export function applyPreviewSync(
     // already correct on screen, and a remount re-flashes the WebGL context AND
     // re-inlines subcomps (reverting their keyframes). The async MotionPath-plugin
     // load failure escalates separately via `onAsyncFailure`.
-    softReloadOrEscalate(iframe, result.scriptText, reloadPreview, "preview_sync", result.after);
+    softReloadOrEscalate(
+      iframe,
+      result.scriptText,
+      reloadPreview,
+      "preview_sync",
+      result.after,
+      nested,
+    );
   } else {
     reloadPreview();
   }
@@ -328,6 +361,7 @@ export function useGsapScriptCommits({ projectIdRef, activeCompPath, previewIfra
 
   const finalizeSuccessfulMutation = useCallback(async (projectId: string, compositionPath: string | null, selection: DomEditSelection, mutation: Record<string, unknown>, targetPath: string, result: MutationResult, options: CommitMutationOptions) => {
     if (projectIdRef.current !== projectId) return;
+    const nested = { from: targetPath, read: (path: string) => readSharedProjectFileContent(projectId, path) };
     const previewIsActive = isActiveCommitTarget(
       projectIdRef,
       activeCompPathRef,
@@ -337,7 +371,7 @@ export function useGsapScriptCommits({ projectIdRef, activeCompPath, previewIfra
     // A no-op file write may still owe the runtime a deferred instant patch.
     if (result.changed === false) {
       if (previewIsActive) {
-        finishUnchangedMutation(previewIframeRef.current, result, options, reloadPreview);
+        finishUnchangedMutation(previewIframeRef.current, result, options, reloadPreview, nested);
       }
       return;
     }
@@ -356,6 +390,7 @@ export function useGsapScriptCommits({ projectIdRef, activeCompPath, previewIfra
       forceReloadSdkSession,
       reloadPreview,
       onCacheInvalidate,
+      nested,
     });
   }, [projectIdRef, previewIframeRef, reloadPreview, onCacheInvalidate, onFileContentChanged, forceReloadSdkSession, recordMutationEdit]);
 
@@ -461,13 +496,20 @@ export function useGsapScriptCommits({ projectIdRef, activeCompPath, previewIfra
         // plugin-CDN load error genuinely breaks the iframe → full reload. Per U4, a
         // synchronous "verify-failed" (transient empty __timelines) does NOT escalate,
         // but a "cannot-soft-reload" (structural failure) does.
-        softReloadOrEscalate(previewIframeRef.current, script, reloadPreview, "sdk_refresh", after);
+        const pid = projectIdRef.current;
+        const nested = pid
+          ? {
+              from: activeCompPathRef.current ?? "index.html",
+              read: (path: string) => readSharedProjectFileContent(pid, path),
+            }
+          : undefined;
+        softReloadOrEscalate(previewIframeRef.current, script, reloadPreview, "sdk_refresh", after, nested);
       } else {
         reloadPreview();
       }
       onCacheInvalidate();
     },
-    [previewIframeRef, reloadPreview, onCacheInvalidate],
+    [previewIframeRef, reloadPreview, onCacheInvalidate, projectIdRef],
   );
   // Read the on-disk bytes of targetPath so the SDK GSAP persist captures the
   // exact prior content as its undo `before` (matching the style/delete paths),

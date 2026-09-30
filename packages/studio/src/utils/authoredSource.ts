@@ -45,7 +45,7 @@ function isRelative(path: string): boolean {
   return !!path && !/^(?:[a-z][a-z\d+.-]*:|\/|#)/i.test(path);
 }
 
-function toProjectPath(sourceFile: string, path: string): string {
+export function toProjectPath(sourceFile: string, path: string): string {
   const parts = sourceFile.split("/").slice(0, -1);
   for (const part of path.split("/")) {
     if (part === "..") parts.pop();

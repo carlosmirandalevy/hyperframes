@@ -7,6 +7,9 @@ import {
   applySoftReloadFinalization,
   extractGsapScriptText,
   findGsapScriptElements,
+  nestedCompositionSources,
+  readNestedFiles,
+  type NestedFileReader,
 } from "./gsapSoftReload";
 import { STUDIO_EDIT_ATTRS } from "../components/editor/manualEditsSeekReapply";
 import { markScenesStale } from "../player/sceneSwap";
@@ -161,6 +164,20 @@ function hasAmbiguousGsapScriptChange(previous: string, restored: string): boole
   );
 }
 
+/** The nested compositions an undo's script re-run would reset elements of, read as written. */
+export async function readUndoNestedFiles(
+  iframe: HTMLIFrameElement | null,
+  files: Record<string, UndoRestoreFile> | undefined,
+  reader: NestedFileReader,
+): Promise<Record<string, string>> {
+  const scripts = Object.values(files ?? {}).flatMap((f) => [f.restored, f.previous]);
+  const sources = scripts.flatMap((html) => {
+    const script = extractGsapScriptText(html);
+    return script ? nestedCompositionSources(iframe, script) : [];
+  });
+  return sources.length ? readNestedFiles([...new Set(sources)], reader) : {};
+}
+
 /**
  * Soft-apply an undo/redo restore to the live preview WITHOUT a full iframe
  * remount (which blanks the frame black and re-flashes the WebGL context). Only
@@ -195,6 +212,7 @@ export function applyUndoRestoreToPreview(
   files: Record<string, UndoRestoreFile> | undefined,
   currentTime: number,
   reload: () => void,
+  nestedFiles?: Record<string, string>,
 ): "soft" | "full" {
   // The master view carries a NULL activeCompPath but the root iframe shows
   // index.html — the codebase-wide convention (`activeCompPath || "index.html"`).
@@ -283,6 +301,7 @@ export function applyUndoRestoreToPreview(
       onAsyncFailure: reloadPreview,
       currentTimeOverride: currentTime,
       authoredHtml: restored,
+      nestedFiles,
       bootstrap: removed ? "removed" : added ? "added" : undefined,
     });
     if (result === "cannot-soft-reload") {
